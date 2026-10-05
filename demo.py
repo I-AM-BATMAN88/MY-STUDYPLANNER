@@ -346,6 +346,18 @@ def inject_css():
             background: transparent;
             border: none;
         }
+        .cal-list-row {
+            border-radius: 14px;
+            padding: 12px 16px;
+            margin-bottom: 6px;
+            box-shadow: 0 2px 5px rgba(0,0,0,0.08);
+            font-family: 'Comic Sans MS', 'Chalkboard SE', 'Brush Script MT', cursive;
+            color: #000000;
+            text-align: left;
+        }
+        .cal-list-row * {
+            color: #000000 !important;
+        }
         div[data-testid="column"] div[data-testid="stButton"] button {
             width: 100%;
             border-radius: 8px;
@@ -373,6 +385,35 @@ def inject_css():
         }
         div[data-testid="stExpander"] {
             border-radius: 10px;
+        }
+        </style>
+    """), unsafe_allow_html=True)
+
+    st.markdown(textwrap.dedent("""
+        <style>
+        @media (max-width: 640px) {
+            div[data-testid="column"] {
+                width: 100% !important;
+                flex: 1 1 100% !important;
+                min-width: 100% !important;
+            }
+            .cal-header {
+                font-size: 1em;
+                padding: 4px 0;
+            }
+            .cal-cell {
+                min-height: auto;
+                padding: 12px 14px;
+                margin-bottom: 10px;
+                font-size: 1.05em;
+            }
+            .subject-card {
+                padding: 12px 14px;
+            }
+            .cal-list-row {
+                padding: 14px 16px;
+                font-size: 1.05em;
+            }
         }
         </style>
     """), unsafe_allow_html=True)
@@ -518,10 +559,62 @@ def render_calendar(timetable, events, start_date, practice_test_link, color_map
                     )
 
 
+def render_calendar_list(timetable, events, start_date, practice_test_link, color_map, today=None, key_prefix="cal"):
+    """
+    Render the timetable as a single vertical list, one full-width card per
+    day. Unlike the 7-column grid, this never gets squeezed on a narrow
+    phone screen -- every card is always full width, so this is the better
+    choice on mobile.
+    """
+    today = today or date.today()
+
+    for e in timetable:
+        day = e["day"]
+        d = start_date + timedelta(days=day - 1) if start_date else None
+        is_past = bool(d and d < today)
+        is_today = bool(d and d == today)
+        label = d.strftime("%A, %b %d") if d else f"Day {day}"
+        weekday_idx = d.weekday() if d else (day - 1) % 7
+        bg_color = WEEKDAY_COLORS[weekday_idx]
+        sticker = WEEKDAY_STICKERS[weekday_idx]
+        day_events = events.get(day, [])
+        exam_flag = " 🎓" if any(etype == "🎓 Exam" for _, etype in day_events) else ""
+
+        css_class = "cal-list-row"
+        if is_past:
+            css_class += " cal-past"
+        elif is_today:
+            css_class += " cal-today"
+
+        if is_past:
+            body = "Done"
+        elif not e["allocations"]:
+            body = e.get("note", "Free day")
+        else:
+            parts = [f"{name}: {to_minutes(hours)} min" for name, hours in e["allocations"]]
+            body = " · ".join(parts)
+
+        event_line = ""
+        if day_events and not is_past:
+            event_line = "<br>" + " · ".join(f"{etype}: {name}" for name, etype in day_events)
+
+        st.markdown(
+            f"<div class='{css_class}' style='background:{bg_color};'>"
+            f"<b>{sticker} {label}</b>{' ✅' if is_past else ' 🔵' if is_today else ''}{exam_flag}"
+            f"<br><span style='font-size:0.85em'>{body}</span>"
+            f"<span style='font-size:0.8em'>{event_line}</span>"
+            f"</div>",
+            unsafe_allow_html=True,
+        )
+
+        if st.button("🔍 Details", key=f"details_list_{key_prefix}_{day}", use_container_width=True):
+            show_day_dialog(label, e["allocations"], day_events, e.get("note"), practice_test_link)
+
+
 # ---------- Persistence (so the calendar auto-updates day to day) ----------
 
 def save_plan(subjects, total_days, hours_per_day, max_subjects_per_day, keep_warm,
-            practice_test_link, anchor_date):
+            practice_test_link, anchor_date, user_name=""):
     data = {
         "anchor_date": anchor_date.isoformat(),
         "total_days": total_days,
@@ -530,6 +623,7 @@ def save_plan(subjects, total_days, hours_per_day, max_subjects_per_day, keep_wa
         "keep_warm": keep_warm,
         "practice_test_link": practice_test_link,
         "subjects": [asdict(s) for s in subjects],
+        "user_name": user_name,
     }
     with open(PLAN_FILE, "w") as f:
         json.dump(data, f)
@@ -542,6 +636,7 @@ def load_plan():
         data = json.load(f)
     data["anchor_date"] = date.fromisoformat(data["anchor_date"])
     data["subjects"] = [Subject(**s) for s in data["subjects"]]
+    data.setdefault("user_name", "")  # older saved plans won't have this key
     return data
 
 
@@ -563,7 +658,10 @@ for _key in list(st.session_state.keys()):
 # --- Intro / welcome screen (shown once per browser session) ---
 if "intro_done" not in st.session_state:
     # Skip the intro automatically for returning users who already have a plan
-    st.session_state["intro_done"] = load_plan() is not None
+    _existing_plan = load_plan()
+    st.session_state["intro_done"] = _existing_plan is not None
+    if _existing_plan is not None:
+        st.session_state["user_name"] = _existing_plan.get("user_name", "")
 
 if not st.session_state["intro_done"]:
     st.title("📚 Welcome to the Study Timetable Optimizer")
@@ -596,13 +694,18 @@ if not st.session_state["intro_done"]:
 
     st.write("Have your recent scores and exam dates ready, then hit the button below to get started.")
 
+    user_name_input = st.text_input("What's your name? (so your calendar can say hi)", key="name_input")
+
     if st.button("Get started →", type="primary"):
+        st.session_state["user_name"] = user_name_input.strip()
         st.session_state["intro_done"] = True
         st.rerun()
 
     st.stop()
 
-st.title("📚 Study Timetable Optimizer")
+user_name = st.session_state.get("user_name", "")
+title_name = f"{user_name}'s " if user_name else ""
+st.title(f"📚 {title_name}Study Timetable Optimizer")
 st.write(
     "Enter your subjects, recent scores, and exam days. The tool allocates "
     "your daily study hours using a diminishing-returns model — weaker "
@@ -614,8 +717,11 @@ st.write(
 # --- Auto-updating view of a saved plan, if one exists ---
 saved = load_plan()
 if saved:
+    saved_name = saved.get("user_name", "")
+    saved_prefix = f"{saved_name}'s " if saved_name else "Your "
+
     st.divider()
-    st.subheader("📅 Your current plan")
+    st.subheader(f"📅 {saved_prefix}current plan")
     st.caption(
         "This updates automatically each day — days that have already "
         "passed are greyed out and marked done."
@@ -631,10 +737,17 @@ if saved:
     events = collect_events(saved["subjects"])
     colors = subject_color_map(saved["subjects"])
 
-    st.markdown("**Your subjects, at a glance**")
+    st.markdown(f"**{saved_prefix}subjects, at a glance**")
     render_subject_cards(saved["subjects"], colors, saved["anchor_date"])
 
-    render_calendar(timetable, events, saved["anchor_date"], saved["practice_test_link"], colors, key_prefix="saved")
+    view_mode_saved = st.radio(
+        "Calendar view", ["📅 Grid (best on PC)", "📋 List (best on phone)"],
+        horizontal=True, key="view_mode_saved", label_visibility="collapsed",
+    )
+    if view_mode_saved.startswith("📋"):
+        render_calendar_list(timetable, events, saved["anchor_date"], saved["practice_test_link"], colors, key_prefix="saved")
+    else:
+        render_calendar(timetable, events, saved["anchor_date"], saved["practice_test_link"], colors, key_prefix="saved")
 
     dl1, dl2 = st.columns(2)
     with dl1:
@@ -782,13 +895,21 @@ if st.session_state.get("plan_generated"):
     colors = subject_color_map(subjects)
 
     save_plan(subjects, int(total_days), hours_per_day, int(max_subjects_per_day),
-            keep_warm, practice_test_link, start_date)
+            keep_warm, practice_test_link, start_date, user_name=user_name)
 
-    st.subheader("Your subjects, at a glance")
+    name_prefix = f"{user_name}'s " if user_name else "Your "
+    st.subheader(f"{name_prefix}subjects, at a glance")
     render_subject_cards(subjects, colors, start_date)
 
     st.subheader("Your calendar")
-    render_calendar(timetable, events, start_date, practice_test_link, colors, key_prefix="new")
+    view_mode_new = st.radio(
+        "Calendar view", ["📅 Grid (best on PC)", "📋 List (best on phone)"],
+        horizontal=True, key="view_mode_new", label_visibility="collapsed",
+    )
+    if view_mode_new.startswith("📋"):
+        render_calendar_list(timetable, events, start_date, practice_test_link, colors, key_prefix="new")
+    else:
+        render_calendar(timetable, events, start_date, practice_test_link, colors, key_prefix="new")
 
     st.caption("Saved — this plan will now appear automatically at the top each time you open the app.")
 
