@@ -655,15 +655,24 @@ for _key in list(st.session_state.keys()):
         _idx = _key.removeprefix("pending_pt_")
         st.session_state[f"pt_{_idx}"] = st.session_state.pop(_key)
 
-# --- Intro / welcome screen (shown once per browser session) ---
+# --- Intro / welcome screen (shown every time the app is opened) ---
 if "intro_done" not in st.session_state:
-    # Skip the intro automatically for returning users who already have a plan
+    st.session_state["intro_done"] = False
     _existing_plan = load_plan()
-    st.session_state["intro_done"] = _existing_plan is not None
     if _existing_plan is not None:
         st.session_state["user_name"] = _existing_plan.get("user_name", "")
 
 if not st.session_state["intro_done"]:
+    _returning = load_plan() is not None
+    _name = st.session_state.get("user_name", "")
+
+    if _returning:
+        st.title(f"📚 Welcome back{', ' + _name if _name else ''}!")
+        if st.button("Continue →", type="primary"):
+            st.session_state["intro_done"] = True
+            st.rerun()
+        st.stop()
+
     st.title("📚 Welcome to the Study Timetable Optimizer")
     st.write(
         "Hi! This tool builds you a day-by-day study schedule for your exams, "
