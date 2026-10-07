@@ -392,6 +392,9 @@ def inject_css():
     st.markdown(textwrap.dedent("""
         <style>
         @media (max-width: 640px) {
+            div[data-testid="stHorizontalBlock"] {
+                flex-wrap: wrap !important;
+            }
             div[data-testid="column"] {
                 width: 100% !important;
                 flex: 1 1 100% !important;
@@ -668,7 +671,12 @@ if not st.session_state["intro_done"]:
 
     if _returning:
         st.title(f"📚 Welcome back{', ' + _name if _name else ''}!")
+        new_name = st.text_input(
+            "What's your name? (so your calendar can say hi)",
+            value=_name, key="returning_name_input",
+        )
         if st.button("Continue →", type="primary"):
+            st.session_state["user_name"] = new_name.strip()
             st.session_state["intro_done"] = True
             st.rerun()
         st.stop()
@@ -751,7 +759,7 @@ if saved:
 
     view_mode_saved = st.radio(
         "Calendar view", ["📅 Grid (best on PC)", "📋 List (best on phone)"],
-        horizontal=True, key="view_mode_saved", label_visibility="collapsed",
+        index=1, horizontal=True, key="view_mode_saved", label_visibility="collapsed",
     )
     if view_mode_saved.startswith("📋"):
         render_calendar_list(timetable, events, saved["anchor_date"], saved["practice_test_link"], colors, key_prefix="saved")
@@ -913,7 +921,7 @@ if st.session_state.get("plan_generated"):
     st.subheader("Your calendar")
     view_mode_new = st.radio(
         "Calendar view", ["📅 Grid (best on PC)", "📋 List (best on phone)"],
-        horizontal=True, key="view_mode_new", label_visibility="collapsed",
+        index=1, horizontal=True, key="view_mode_new", label_visibility="collapsed",
     )
     if view_mode_new.startswith("📋"):
         render_calendar_list(timetable, events, start_date, practice_test_link, colors, key_prefix="new")
