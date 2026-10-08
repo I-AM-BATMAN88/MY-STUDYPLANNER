@@ -825,6 +825,29 @@ with st.sidebar:
     keep_warm = st.checkbox("Keep every subject warm (rotating maintenance slot)", value=True)
     st.caption("Confidence is fixed at 30% weight alongside your recent scores.")
 
+with st.sidebar:
+    st.divider()
+    st.markdown("**📤 Share this app**")
+    _base_url = None
+    try:
+        # st.context.url only exists in newer Streamlit versions
+        _base_url = str(st.context.url).split("?")[0]
+    except Exception:
+        _base_url = None
+    if _base_url and _base_url.startswith("http"):
+        st.code(_base_url, language=None)
+        st.caption(
+            "Send friends THIS link. It has no personal ID in it, so they "
+            "get their own fresh plan. Don't copy the link from your address "
+            "bar — that one is yours and opens your plan."
+        )
+    else:
+        st.caption(
+            "To share the app, copy the link from your address bar and delete "
+            "everything from the `?` onwards. If you send the full link with "
+            "`?u=...`, friends will open YOUR plan."
+        )
+
 # Past Paper Tracker link -- kept in code only, not shown as an editable field.
 # See the Welcome page for the user-facing explanation of what this is.
 practice_test_link = "https://chromewebstore.google.com/detail/past-paper-tracker/cmadpkpdpbcklhhijkmbajjolfmopgko"
