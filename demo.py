@@ -15,11 +15,40 @@ import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import date, timedelta
 from typing import List, Optional
+from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
 
 PLANS_DIR = "plans"  # one JSON file per visitor, named by their private ID
+
+# Paste your deployed app's link here (no ?u=... part), e.g.
+# APP_URL = "https://yourname-studyplanner.streamlit.app"
+# This is what the "Share on WhatsApp" buttons send. If left empty, the app
+# tries to work the link out itself, which only works on newer Streamlit.
+APP_URL = ""
+
+
+def get_share_url():
+    """The clean app link to share (never includes a personal ?u=... ID)."""
+    if APP_URL.strip():
+        return APP_URL.strip().split("?")[0]
+    try:
+        url = str(st.context.url).split("?")[0]  # newer Streamlit only
+        if url.startswith("http"):
+            return url
+    except Exception:
+        pass
+    return None
+
+
+def whatsapp_share_link(url):
+    """A wa.me link that opens WhatsApp with the message already typed."""
+    text = (
+        "Check out this study timetable planner. It builds a day-by-day study "
+        "schedule from your exam scores and exam dates: " + url
+    )
+    return "https://wa.me/?text=" + quote(text)
 CONFIDENCE_WEIGHT = 0.3  # fixed: confidence always counts for 30% of effective score
 
 SUBJECT_COLORS = ["#4C6EF5", "#F76707", "#2F9E44", "#AE3EC9", "#1098AD", "#E8590C", "#5C940D"]
@@ -828,19 +857,13 @@ with st.sidebar:
 with st.sidebar:
     st.divider()
     st.markdown("**📤 Share this app**")
-    _base_url = None
-    try:
-        # st.context.url only exists in newer Streamlit versions
-        _base_url = str(st.context.url).split("?")[0]
-    except Exception:
-        _base_url = None
-    if _base_url and _base_url.startswith("http"):
-        st.code(_base_url, language=None)
-        st.caption(
-            "Send friends THIS link. It has no personal ID in it, so they "
-            "get their own fresh plan. Don't copy the link from your address "
-            "bar — that one is yours and opens your plan."
+    _share_url = get_share_url()
+    if _share_url:
+        st.link_button(
+            "💬 Share on WhatsApp", whatsapp_share_link(_share_url),
+            use_container_width=True, key="wa_share_sidebar",
         )
+        st.caption("Sends a clean link, so friends get their own fresh plan.")
     else:
         st.caption(
             "To share the app, copy the link from your address bar and delete "
@@ -1020,6 +1043,18 @@ if st.session_state.get("plan_generated"):
             "subject warm' is on, one slot a day (20% of your hours) goes to "
             "whichever leftover subject has gone longest without study."
         )
+
+
+# ---------- Share ----------
+
+_share_url_main = get_share_url()
+if _share_url_main:
+    st.divider()
+    st.subheader("📤 Share with friends")
+    st.link_button(
+        "💬 Share on WhatsApp", whatsapp_share_link(_share_url_main),
+        key="wa_share_main",
+    )
 
 
 # ---------- Feedback ----------
