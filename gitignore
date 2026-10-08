@@ -1,0 +1,5 @@
+plans/
+saved_plan.json
+feedback.csv
+__pycache__/
+*.pyc
