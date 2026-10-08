@@ -10,6 +10,8 @@ Requires: pip install streamlit pandas
 
 import json
 import os
+import re
+import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import date, timedelta
 from typing import List, Optional
@@ -17,7 +19,7 @@ from typing import List, Optional
 import pandas as pd
 import streamlit as st
 
-PLAN_FILE = "saved_plan.json"
+PLANS_DIR = "plans"  # one JSON file per visitor, named by their private ID
 CONFIDENCE_WEIGHT = 0.3  # fixed: confidence always counts for 30% of effective score
 
 SUBJECT_COLORS = ["#4C6EF5", "#F76707", "#2F9E44", "#AE3EC9", "#1098AD", "#E8590C", "#5C940D"]
@@ -616,7 +618,20 @@ def render_calendar_list(timetable, events, start_date, practice_test_link, colo
 
 # ---------- Persistence (so the calendar auto-updates day to day) ----------
 
-def save_plan(subjects, total_days, hours_per_day, max_subjects_per_day, keep_warm,
+def valid_uid(uid):
+    """Visitor IDs come from the URL, so only allow plain letters/digits
+    (stops anyone sneaking a file path like ../ into the filename)."""
+    return isinstance(uid, str) and re.fullmatch(r"[A-Za-z0-9]{8,32}", uid) is not None
+
+
+def plan_path(uid):
+    if not valid_uid(uid):
+        raise ValueError("Invalid visitor ID")
+    os.makedirs(PLANS_DIR, exist_ok=True)
+    return os.path.join(PLANS_DIR, f"{uid}.json")
+
+
+def save_plan(uid, subjects, total_days, hours_per_day, max_subjects_per_day, keep_warm,
             practice_test_link, anchor_date, user_name=""):
     data = {
         "anchor_date": anchor_date.isoformat(),
@@ -628,14 +643,15 @@ def save_plan(subjects, total_days, hours_per_day, max_subjects_per_day, keep_wa
         "subjects": [asdict(s) for s in subjects],
         "user_name": user_name,
     }
-    with open(PLAN_FILE, "w") as f:
+    with open(plan_path(uid), "w") as f:
         json.dump(data, f)
 
 
-def load_plan():
-    if not os.path.exists(PLAN_FILE):
+def load_plan(uid):
+    path = plan_path(uid)
+    if not os.path.exists(path):
         return None
-    with open(PLAN_FILE) as f:
+    with open(path) as f:
         data = json.load(f)
     data["anchor_date"] = date.fromisoformat(data["anchor_date"])
     data["subjects"] = [Subject(**s) for s in data["subjects"]]
@@ -647,6 +663,17 @@ def load_plan():
 
 st.set_page_config(page_title="Study Timetable Optimizer", page_icon="📚", layout="wide")
 inject_css()
+
+# --- Private visitor ID: keeps every person's plan separate ---
+# A new visitor gets a random ID that is written into their link (?u=...).
+# Their plan is saved under that ID, so people who open the plain shared
+# link start fresh instead of seeing someone else's data.
+if "uid" not in st.session_state:
+    _from_url = st.query_params.get("u")
+    st.session_state["uid"] = _from_url if valid_uid(_from_url) else uuid.uuid4().hex[:12]
+uid = st.session_state["uid"]
+if st.query_params.get("u") != uid:
+    st.query_params["u"] = uid
 
 # A widget's session_state value can't be changed after that widget has
 # already been created in the same run. So the "insert suggested day"
@@ -661,12 +688,12 @@ for _key in list(st.session_state.keys()):
 # --- Intro / welcome screen (shown every time the app is opened) ---
 if "intro_done" not in st.session_state:
     st.session_state["intro_done"] = False
-    _existing_plan = load_plan()
+    _existing_plan = load_plan(uid)
     if _existing_plan is not None:
         st.session_state["user_name"] = _existing_plan.get("user_name", "")
 
 if not st.session_state["intro_done"]:
-    _returning = load_plan() is not None
+    _returning = load_plan(uid) is not None
     _name = st.session_state.get("user_name", "")
 
     if _returning:
@@ -732,7 +759,7 @@ st.write(
 )
 
 # --- Auto-updating view of a saved plan, if one exists ---
-saved = load_plan()
+saved = load_plan(uid)
 if saved:
     saved_name = saved.get("user_name", "")
     saved_prefix = f"{saved_name}'s " if saved_name else "Your "
@@ -783,7 +810,7 @@ if saved:
         )
 
     if st.button("🔄 Start a new plan"):
-        os.remove(PLAN_FILE)
+        os.remove(plan_path(uid))
         st.rerun()
 
 st.divider()
@@ -911,7 +938,7 @@ if st.session_state.get("plan_generated"):
     events = collect_events(subjects)
     colors = subject_color_map(subjects)
 
-    save_plan(subjects, int(total_days), hours_per_day, int(max_subjects_per_day),
+    save_plan(uid, subjects, int(total_days), hours_per_day, int(max_subjects_per_day),
             keep_warm, practice_test_link, start_date, user_name=user_name)
 
     name_prefix = f"{user_name}'s " if user_name else "Your "
@@ -928,7 +955,14 @@ if st.session_state.get("plan_generated"):
     else:
         render_calendar(timetable, events, start_date, practice_test_link, colors, key_prefix="new")
 
-    st.caption("Saved — this plan will now appear automatically at the top each time you open the app.")
+    st.caption(
+        "🔖 Saved. Bookmark this page (or add it to your home screen) — the link in "
+        "your address bar is your personal link, and it's how you get back to your plan."
+    )
+    st.caption(
+        "📤 Sharing the app with friends? Send them the link **without** the "
+        "`?u=...` part, so they start with their own fresh plan."
+    )
 
     dl1, dl2 = st.columns(2)
     with dl1:
