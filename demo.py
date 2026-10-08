@@ -19,6 +19,7 @@ from urllib.parse import quote
 
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 
 PLANS_DIR = "plans"  # one JSON file per visitor, named by their private ID
 
@@ -49,6 +50,55 @@ def whatsapp_share_link(url):
         "schedule from your exam scores and exam dates: " + url
     )
     return "https://wa.me/?text=" + quote(text)
+
+
+def copy_button_html(url):
+    """A small 'Copy link' button. Streamlit has no built-in copy-to-clipboard
+    button, so this is a tiny HTML/JS snippet shown inside the page."""
+    return f"""
+<button id="copybtn" style="
+    width:100%; height:38px; cursor:pointer; font-size:15px;
+    font-family:'Source Sans Pro',sans-serif; color:#31333F; background:#FFFFFF;
+    border:1px solid rgba(49,51,63,0.25); border-radius:8px;">🔗 Copy link</button>
+<script>
+const url = {json.dumps(url)};
+const btn = document.getElementById("copybtn");
+function fallbackCopy() {{
+  const t = document.createElement("textarea");
+  t.value = url; t.style.position = "fixed"; t.style.opacity = "0";
+  document.body.appendChild(t); t.focus(); t.select();
+  let ok = false;
+  try {{ ok = document.execCommand("copy"); }} catch (e) {{}}
+  document.body.removeChild(t);
+  return ok;
+}}
+btn.addEventListener("click", async () => {{
+  let ok = false;
+  try {{ await navigator.clipboard.writeText(url); ok = true; }}
+  catch (e) {{ ok = fallbackCopy(); }}
+  btn.textContent = ok ? "✅ Link copied!" : "⚠️ Couldn't copy - use the box below";
+  setTimeout(() => {{ btn.textContent = "🔗 Copy link"; }}, 2500);
+}});
+</script>
+"""
+
+
+def render_share_buttons(url, key_prefix, side_by_side=True):
+    """Two buttons: share on WhatsApp, and copy the link."""
+    wa_label = "💬 Share on WhatsApp"
+    if side_by_side:
+        c1, c2 = st.columns(2)
+        with c1:
+            st.link_button(wa_label, whatsapp_share_link(url),
+                           use_container_width=True, key=f"{key_prefix}_wa")
+        with c2:
+            components.html(copy_button_html(url), height=44)
+    else:
+        st.link_button(wa_label, whatsapp_share_link(url),
+                       use_container_width=True, key=f"{key_prefix}_wa")
+        components.html(copy_button_html(url), height=44)
+    with st.expander("Copy didn't work? Copy the link from here"):
+        st.code(url, language=None)
 CONFIDENCE_WEIGHT = 0.3  # fixed: confidence always counts for 30% of effective score
 
 SUBJECT_COLORS = ["#4C6EF5", "#F76707", "#2F9E44", "#AE3EC9", "#1098AD", "#E8590C", "#5C940D"]
@@ -859,10 +909,7 @@ with st.sidebar:
     st.markdown("**📤 Share this app**")
     _share_url = get_share_url()
     if _share_url:
-        st.link_button(
-            "💬 Share on WhatsApp", whatsapp_share_link(_share_url),
-            use_container_width=True, key="wa_share_sidebar",
-        )
+        render_share_buttons(_share_url, "share_sidebar", side_by_side=False)
         st.caption("Sends a clean link, so friends get their own fresh plan.")
     else:
         st.caption(
@@ -1051,10 +1098,7 @@ _share_url_main = get_share_url()
 if _share_url_main:
     st.divider()
     st.subheader("📤 Share with friends")
-    st.link_button(
-        "💬 Share on WhatsApp", whatsapp_share_link(_share_url_main),
-        key="wa_share_main",
-    )
+    render_share_buttons(_share_url_main, "share_main", side_by_side=True)
 
 
 # ---------- Feedback ----------
