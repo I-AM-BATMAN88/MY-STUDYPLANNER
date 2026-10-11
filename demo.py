@@ -11,9 +11,10 @@ Requires: pip install streamlit pandas
 import json
 import os
 import re
+import time
 import uuid
 from dataclasses import dataclass, field, asdict
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from typing import List, Optional
 from urllib.parse import quote
 
@@ -22,6 +23,17 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 PLANS_DIR = "plans"  # one JSON file per visitor, named by their private ID
+USAGE_DIR = "usage"  # one tiny file per visit, used to measure time spent in the app
+BOTSWANA_TZ = timezone(timedelta(hours=2))  # Botswana (CAT) is UTC+2 all year
+
+# How far through the app a visitor got, in order. Used to see where people stop.
+STAGE_ORDER = {"welcome": 0, "form": 1, "viewed_plan": 2, "generated": 3}
+STAGE_LABELS = {
+    "welcome": "Only saw the welcome page",
+    "form": "Reached the form",
+    "viewed_plan": "Viewed a saved plan",
+    "generated": "Made a timetable",
+}
 
 # Paste your deployed app's link here (no ?u=... part), e.g.
 # APP_URL = "https://yourname-studyplanner.streamlit.app"
@@ -738,6 +750,48 @@ def load_plan(uid):
     return data
 
 
+def record_usage(session_id, uid, start_ts, stage):
+    """Create or refresh the small file that records one visit.
+    One file per visit means two people using the app at once can never
+    overwrite each other. Tracking must never break the app, so any file
+    problem is ignored."""
+    try:
+        if not re.fullmatch(r"[a-f0-9]{8,32}", str(session_id)):
+            return
+        os.makedirs(USAGE_DIR, exist_ok=True)
+        now = time.time()
+        data = {
+            "session_id": session_id, "uid": uid, "start": start_ts,
+            "last_seen": now, "seconds": int(now - start_ts), "stage": stage,
+        }
+        path = os.path.join(USAGE_DIR, f"{session_id}.json")
+        tmp = path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def load_usage():
+    """All recorded visits as a table (newest first), in Botswana time."""
+    rows = []
+    if os.path.isdir(USAGE_DIR):
+        for fn in os.listdir(USAGE_DIR):
+            if fn.endswith(".json"):
+                try:
+                    with open(os.path.join(USAGE_DIR, fn)) as f:
+                        rows.append(json.load(f))
+                except (OSError, ValueError):
+                    continue
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows)
+    df["started_at"] = pd.to_datetime(df["start"], unit="s", utc=True).dt.tz_convert(BOTSWANA_TZ)
+    df["minutes"] = (df["seconds"] / 60).round(1)
+    return df.sort_values("start", ascending=False).reset_index(drop=True)
+
+
 # ---------- Streamlit UI ----------
 
 st.set_page_config(page_title="Study Timetable Optimizer", page_icon="📚", layout="wide")
@@ -753,6 +807,39 @@ if "uid" not in st.session_state:
 uid = st.session_state["uid"]
 if st.query_params.get("u") != uid:
     st.query_params["u"] = uid
+
+# --- Measure time spent in the app ---
+# Each visit gets its own ID and start time. The time is saved every time the
+# visitor does something, and also every 30 seconds while the page stays open
+# (Streamlit 1.37+). So "time in the app" = how long the page was open.
+if "session_id" not in st.session_state:
+    st.session_state["session_id"] = uuid.uuid4().hex[:16]
+    st.session_state["visit_start"] = time.time()
+    st.session_state["stage"] = "welcome"
+
+
+def log_visit():
+    record_usage(
+        st.session_state["session_id"], uid,
+        st.session_state["visit_start"], st.session_state["stage"],
+    )
+
+
+def set_stage(stage):
+    """Remember the furthest point reached (never goes backwards)."""
+    current = st.session_state.get("stage", "welcome")
+    if STAGE_ORDER[stage] > STAGE_ORDER.get(current, 0):
+        st.session_state["stage"] = stage
+    log_visit()
+
+
+log_visit()
+if hasattr(st, "fragment"):
+    @st.fragment(run_every=30)
+    def _heartbeat():
+        log_visit()
+
+    _heartbeat()
 
 # A widget's session_state value can't be changed after that widget has
 # already been created in the same run. So the "insert suggested day"
@@ -784,44 +871,56 @@ if not st.session_state["intro_done"]:
         if st.button("Continue →", type="primary"):
             st.session_state["user_name"] = new_name.strip()
             st.session_state["intro_done"] = True
+            set_stage("form")
             st.rerun()
         st.stop()
 
     st.title("📚 Welcome to the Study Timetable Optimizer")
     st.write(
-        "Hi! This tool builds you a day-by-day study schedule for your exams, "
-        "based on how you're actually doing in each subject — not just an even "
-        "split of your time."
+        "This tool makes you a day-by-day study timetable for your exams. "
+        "It gives more time to the subjects you find harder and to the exams "
+        "that are coming up soonest."
     )
-    st.markdown("**Here's how it works:**")
+    st.markdown("**It takes about 3 minutes. Here's what you'll do:**")
     st.markdown(
-        "- You enter your subjects, your last few exam scores, and how "
-        "confident you feel in each one\n"
-        "- You tell it your exam dates, how many hours a day you can study, "
-        "and how many subjects you want to juggle per day\n"
-        "- It works out a schedule that gives weaker subjects and closer "
-        "exams more of your time, while still keeping every subject "
-        "ticking over so nothing gets forgotten\n"
-        "- You get a colorful calendar you can click into for details, "
-        "download, or print — and it automatically updates as days pass"
+        "1. **Type your name** below and press *Get started*\n"
+        "2. **Step 1:** choose your start date and how many hours you can study each day\n"
+        "3. **Step 2:** add each subject: its name, your last 3 exam marks, "
+        "how confident you feel, and the day of its exam\n"
+        "4. **Step 3:** press the big *Make my timetable* button. "
+        "Your calendar appears right below it"
+    )
+    st.info(
+        "**Have these ready:** your last 3 full-exam marks for each subject "
+        "(as percentages) and the date of each exam."
+    )
+    st.markdown("**After you make your timetable**")
+    st.write(
+        "Bookmark the page and come back each day. Days that have passed turn "
+        "grey on their own, so you always see what's next."
     )
     st.markdown("**About the Past Paper Tracker:**")
     st.write(
-        "If you schedule a practice test for a subject, the calendar will show "
-        "a button linking to the Past Paper Tracker — a free Chrome extension "
-        "for keeping track of your practice test scores over time. You'll need "
-        "to download and install it yourself from the Chrome Web Store. "
-        "Note that it only works on a PC/laptop, since it's a browser "
-        "extension — it won't work on mobile."
+        "If you plan a practice paper for a subject, your calendar shows a "
+        "button linking to the Past Paper Tracker, a free Chrome extension for "
+        "keeping track of your practice test scores. You install it yourself "
+        "from the Chrome Web Store, and it only works on a PC or laptop, not "
+        "on a phone."
+    )
+    st.caption(
+        "To improve the app, we record when you open it and how long you stay, "
+        "using a random ID instead of your name."
     )
 
-    st.write("Have your recent scores and exam dates ready, then hit the button below to get started.")
-
-    user_name_input = st.text_input("What's your name? (so your calendar can say hi)", key="name_input")
+    user_name_input = st.text_input(
+        "What's your name? (so your calendar can say hi)",
+        key="name_input", placeholder="e.g. Thandi",
+    )
 
     if st.button("Get started →", type="primary"):
         st.session_state["user_name"] = user_name_input.strip()
         st.session_state["intro_done"] = True
+        set_stage("form")
         st.rerun()
 
     st.stop()
@@ -829,17 +928,48 @@ if not st.session_state["intro_done"]:
 user_name = st.session_state.get("user_name", "")
 title_name = f"{user_name}'s " if user_name else ""
 st.title(f"📚 {title_name}Study Timetable Optimizer")
-st.write(
-    "Enter your subjects, recent scores, and exam days. The tool allocates "
-    "your daily study hours using a diminishing-returns model — weaker "
-    "subjects and closer exams get more time, while a rotating slot keeps "
-    "every other subject from going cold. Confidence is factored in at a "
-    "fixed 30% weight alongside your recent scores."
+st.info(
+    "👋 **How to use this page:** there are 3 steps below. "
+    "**Step 1:** your study setup. **Step 2:** your subjects. "
+    "**Step 3:** press the button to get your timetable."
 )
+with st.expander("❓ Need help? Tap here for answers to common questions"):
+    st.markdown(
+        '**What is a "day number"?** Day 1 is your start date, day 2 is the next day, '
+        "and so on. The page shows the real date next to each exam day so you can check it.\n\n"
+        "**Which marks do I enter?** Your percentage marks from your last 3 full exams in that "
+        "subject, oldest first. If you only have one, type it in all three boxes.\n\n"
+        '**What does "confidence" mean?** How sure you feel about the subject right now, from '
+        "1 (not at all) to 10 (very). It counts for 30% of how the timetable judges the "
+        "subject. Your marks count for the rest.\n\n"
+        '**What does "most subjects in one day" mean?** The most different subjects you want '
+        "to study in a single day. 3 is a good start.\n\n"
+        "**What are the practice paper days?** They are optional. Type day numbers separated "
+        "by commas. They show on your calendar with a Past Paper Tracker button (a Chrome "
+        "extension that only works on a PC).\n\n"
+        "**Why is there no study time on an exam day?** Exam days are for sitting the exam, "
+        "so that subject is left out that day.\n\n"
+        "**How do I come back to my timetable?** Bookmark this page, or add it to your "
+        "phone's home screen. The link in your address bar is your personal link. Days that "
+        "have passed turn grey on their own.\n\n"
+        "**The calendar looks cramped on my phone.** Switch to the **List** layout just above "
+        "the calendar."
+    )
+
+
+def show_legend():
+    st.info(
+        "📖 **How to read your timetable:** each box is one day, and the lines show how many "
+        "**minutes** to spend on each subject. 🔵 = today · ✅ = finished · 🎓 = exam day. "
+        "Tap **🔍 Details** on any day for the full breakdown. You can switch between the "
+        "**Grid** and **List** layouts just above the calendar."
+    )
+
 
 # --- Auto-updating view of a saved plan, if one exists ---
 saved = load_plan(uid)
 if saved:
+    set_stage("viewed_plan")
     saved_name = saved.get("user_name", "")
     saved_prefix = f"{saved_name}'s " if saved_name else "Your "
 
@@ -849,6 +979,7 @@ if saved:
         "This updates automatically each day — days that have already "
         "passed are greyed out and marked done."
     )
+    show_legend()
     timetable = build_timetable(
         subjects=saved["subjects"],
         total_days=saved["total_days"],
@@ -888,21 +1019,52 @@ if saved:
             use_container_width=True, key="html_top",
         )
 
-    if st.button("🔄 Start a new plan"):
+    if st.button("🔄 Start a new plan", help="Deletes this timetable so you can start again from scratch."):
         os.remove(plan_path(uid))
         st.rerun()
 
 st.divider()
 
-# --- Sidebar: global settings ---
-with st.sidebar:
-    st.header("Settings")
-    start_date = st.date_input("When do you want to start?", value=date.today())
-    total_days = st.number_input("Total days to plan", min_value=1, max_value=120, value=30)
-    hours_per_day = st.number_input("Study hours per day", min_value=0.5, max_value=16.0, value=5.0, step=0.5)
-    max_subjects_per_day = st.number_input("Max subjects per day", min_value=1, max_value=10, value=3)
-    keep_warm = st.checkbox("Keep every subject warm (rotating maintenance slot)", value=True)
-    st.caption("Confidence is fixed at 30% weight alongside your recent scores.")
+# --- Step 1: study setup (on the main page, because phones hide the sidebar) ---
+if saved:
+    st.info(
+        "✏️ Want to change your plan? Update the steps below and press "
+        "**Make my timetable** again. It replaces your current plan."
+    )
+
+st.subheader("Step 1 of 3 · Your study setup")
+st.caption("Tell us how much time you have for studying.")
+
+setup_left, setup_right = st.columns(2)
+with setup_left:
+    start_date = st.date_input(
+        "When do you want to start?", value=date.today(), key="setup_start",
+        help="The first day of your timetable. Pick today unless you're planning ahead.",
+    )
+    hours_per_day = st.number_input(
+        "How many hours can you study each day?",
+        min_value=0.5, max_value=16.0, value=5.0, step=0.5, key="setup_hours",
+        help="Be realistic. A plan you can keep up beats a bigger one you can't.",
+    )
+with setup_right:
+    total_days = st.number_input(
+        "How many days should the plan cover?",
+        min_value=1, max_value=120, value=30, key="setup_days",
+        help="Make this long enough to reach your last exam. For example, if your "
+             "last exam is in 3 weeks, use at least 21.",
+    )
+    max_subjects_per_day = st.number_input(
+        "Most subjects to study in one day",
+        min_value=1, max_value=10, value=3, key="setup_max",
+        help="3 is a good start. Fewer subjects per day means longer sessions on each one.",
+    )
+plan_end = start_date + timedelta(days=int(total_days) - 1)
+st.caption(f"📅 Your plan will run from **{start_date:%a %d %b}** to **{plan_end:%a %d %b %Y}**.")
+keep_warm = st.checkbox(
+    "Keep every subject ticking over", value=True, key="setup_warm",
+    help="Reserves a little time each day for the subject you've studied least recently, "
+         "so no subject is forgotten while you focus on the urgent ones.",
+)
 
 with st.sidebar:
     st.divider()
@@ -923,42 +1085,80 @@ with st.sidebar:
 practice_test_link = "https://chromewebstore.google.com/detail/past-paper-tracker/cmadpkpdpbcklhhijkmbajjolfmopgko"
 
 # --- Subject inputs ---
-st.subheader("Your subjects")
-st.caption("Enter your last 3 full exam scores if you have them — leave later ones equal to your "
-        "most recent if you don't have 3 yet.")
+st.subheader("Step 2 of 3 · Add your subjects")
+st.caption(
+    "Add one box per subject. If a subject has two papers, add each paper "
+    "separately (for example *Physics Paper 1* and *Physics Paper 2*)."
+)
 
-num_subjects = st.number_input("How many subjects/papers?", min_value=1, max_value=15, value=6)
+num_subjects = st.number_input(
+    "How many subjects or papers are you sitting?",
+    min_value=1, max_value=15, value=6,
+    help="The right number of boxes will appear below.",
+)
 
 subjects = []
 for i in range(int(num_subjects)):
     with st.expander(f"Subject {i + 1}", expanded=True):
-        name = st.text_input("Name", value=f"Subject {i + 1}", key=f"name_{i}")
-
-        sc1, sc2, sc3 = st.columns(3)
-        with sc1:
-            s1 = st.number_input("Score (oldest)", 0, 100, 70, key=f"s1_{i}")
-        with sc2:
-            s2 = st.number_input("Score (middle)", 0, 100, 70, key=f"s2_{i}")
-        with sc3:
-            s3 = st.number_input("Score (most recent)", 0, 100, 70, key=f"s3_{i}")
-
-        confidence = st.slider("Confidence (1-10)", 1, 10, 5, key=f"conf_{i}")
-        exam_day = st.number_input(
-            "Exam day (days from your start date)", min_value=1, max_value=int(total_days),
-            value=min(int(total_days), 14), key=f"day_{i}",
+        name = st.text_input(
+            "Subject name", value=f"Subject {i + 1}", key=f"name_{i}",
+            help="Type the real name, for example Mathematics Paper 1.",
         )
 
-        has_deadline = st.checkbox("Set a 'finish content by' deadline?", key=f"hasdl_{i}")
+        st.caption(
+            "Your marks from your last 3 full exams, as percentages (0 to 100). "
+            "Oldest first. If you only have one, type it in all three boxes."
+        )
+        sc1, sc2, sc3 = st.columns(3)
+        with sc1:
+            s1 = st.number_input("Oldest (%)", 0, 100, 70, key=f"s1_{i}",
+                                 help="Your mark in the oldest of the 3 exams.")
+        with sc2:
+            s2 = st.number_input("Middle (%)", 0, 100, 70, key=f"s2_{i}",
+                                 help="Your mark in the exam between the other two.")
+        with sc3:
+            s3 = st.number_input("Latest (%)", 0, 100, 70, key=f"s3_{i}",
+                                 help="Your mark in your most recent exam. This one counts the most.")
+
+        confidence = st.slider(
+            "How confident do you feel? (1 = not at all, 10 = very)", 1, 10, 5,
+            key=f"conf_{i}",
+            help="Be honest. A low number tells the timetable to give this subject more time.",
+        )
+
+        # Keep earlier answers valid if the plan length or exam day is lowered later
+        if st.session_state.get(f"day_{i}", 0) > int(total_days):
+            st.session_state[f"day_{i}"] = int(total_days)
+        exam_day = st.number_input(
+            "Exam is on day number…", min_value=1, max_value=int(total_days),
+            value=min(int(total_days), 14), key=f"day_{i}",
+            help="Day 1 is your start date, day 2 is the next day, and so on. Example: "
+                 "if you start on a Monday and the exam is the following Monday, enter 8.",
+        )
+        exam_date = start_date + timedelta(days=int(exam_day) - 1)
+        st.caption(f"📅 That's **{exam_date:%A %d %B}**. If that's wrong, change the day number.")
+
+        has_deadline = st.checkbox(
+            "Add a 'finish the content by' day? (optional)", key=f"hasdl_{i}",
+            help="A day by which you want to have covered all the content, so the time "
+                 "after it can go on revision and past papers.",
+        )
         material_deadline_day = None
         if has_deadline:
+            if st.session_state.get(f"dl_{i}", 0) > int(exam_day):
+                st.session_state[f"dl_{i}"] = int(exam_day)
             material_deadline_day = st.number_input(
-                "Finish content by day", min_value=1, max_value=int(exam_day),
+                "Finish the content by day number", min_value=1, max_value=int(exam_day),
                 value=min(int(exam_day), 7), key=f"dl_{i}",
+                help="Same numbering as above: day 1 is your start date.",
             )
 
         practice_days_str = st.text_input(
-            "Practice test days (comma-separated, optional, e.g. 5,10,18)",
-            key=f"pt_{i}",
+            "Days for a full practice paper (optional)",
+            key=f"pt_{i}", placeholder="e.g. 5, 10, 18",
+            help="Type day numbers separated by commas. Each one shows a Past Paper "
+                 "Tracker button on your calendar. At most 3 subjects can have a "
+                 "practice paper on the same day.",
         )
         practice_test_days = [
             int(tok.strip()) for tok in practice_days_str.split(",")
@@ -967,7 +1167,7 @@ for i in range(int(num_subjects)):
 
         subjects.append(
             Subject(
-                name=name,
+                name=name.strip(),
                 scores=[s1, s2, s3],
                 exam_day=exam_day,
                 confidence=confidence,
@@ -977,12 +1177,34 @@ for i in range(int(num_subjects)):
             )
         )
 
-st.divider()
+# --- Friendly checks before the timetable is made ---
+_names = [sub.name.strip().lower() for sub in subjects]
+can_generate = True
+if any(n == "" for n in _names):
+    st.error("Every subject needs a name. Please fill in the empty name box.")
+    can_generate = False
+elif len(set(_names)) < len(_names):
+    st.error(
+        "Two subjects have the same name. Give each its own name, for example "
+        "'Physics Paper 1' and 'Physics Paper 2'."
+    )
+    can_generate = False
+elif any(re.fullmatch(r"subject \d+", n) for n in _names):
+    st.warning(
+        "✏️ Some subjects are still called 'Subject 1', 'Subject 2' and so on. "
+        "Type your real subject names so your timetable makes sense."
+    )
 
-if st.button("Generate / update my study timetable", type="primary"):
+st.divider()
+st.subheader("Step 3 of 3 · Make your timetable")
+st.caption("When everything above looks right, press the button. Your timetable appears just below it.")
+
+if st.button("✨ Make my timetable", type="primary", disabled=not can_generate):
     st.session_state["plan_generated"] = True
 
-if st.session_state.get("plan_generated"):
+if st.session_state.get("plan_generated") and can_generate:
+    set_stage("generated")
+    st.success("✅ Done! Your timetable is below.")
     name_to_index = {s.name: i for i, s in enumerate(subjects)}
     practice_test_results = enforce_practice_test_limit(subjects, max_per_day=3)
 
@@ -1039,6 +1261,7 @@ if st.session_state.get("plan_generated"):
     render_subject_cards(subjects, colors, start_date)
 
     st.subheader("Your calendar")
+    show_legend()
     view_mode_new = st.radio(
         "Calendar view", ["📅 Grid (best on PC)", "📋 List (best on phone)"],
         index=1, horizontal=True, key="view_mode_new", label_visibility="collapsed",
@@ -1131,9 +1354,68 @@ if st.button("Submit feedback"):
 # the source code can see it), but it keeps it off the main page.
 ADMIN_PASSCODE = "studyplanner2026"
 
-with st.expander("📊 View/download collected feedback (admin only)"):
+with st.expander("📊 Admin: usage and feedback (passcode needed)"):
     entered = st.text_input("Passcode", type="password", key="admin_passcode")
     if entered == ADMIN_PASSCODE:
+        st.markdown("### Usage")
+        usage = load_usage()
+        if usage.empty:
+            st.info("No visits recorded yet.")
+        else:
+            made_plan = int((usage["stage"] == "generated").sum())
+            busiest_hour = int(usage["started_at"].dt.hour.value_counts().idxmax())
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                st.metric("Visits", len(usage))
+                st.metric("Different visitors", int(usage["uid"].nunique()))
+            with m2:
+                st.metric("Typical time per visit (median)", f"{usage['minutes'].median():.1f} min")
+                st.metric("Average time per visit", f"{usage['minutes'].mean():.1f} min")
+            with m3:
+                st.metric("Visits that made a timetable", f"{made_plan} ({made_plan / len(usage):.0%})")
+                st.metric("Busiest hour (Botswana time)", f"{busiest_hour:02d}:00")
+
+            st.markdown("**How far people got** (shows where they stop)")
+            funnel = usage["stage"].map(STAGE_LABELS).value_counts()
+            ordered = [STAGE_LABELS[k] for k in sorted(STAGE_ORDER, key=STAGE_ORDER.get)]
+            st.dataframe(
+                funnel.reindex(ordered, fill_value=0).rename("Visits").to_frame(),
+                use_container_width=True,
+            )
+
+            st.markdown("**Visits by hour of the day** (Botswana time)")
+            by_hour = usage["started_at"].dt.hour.value_counts().reindex(range(24), fill_value=0).sort_index()
+            st.bar_chart(by_hour)
+
+            st.markdown("**Recent visits**")
+            recent = usage.head(30).copy()
+            recent["When (Botswana time)"] = recent["started_at"].dt.strftime("%a %d %b, %H:%M")
+            recent["Furthest step"] = recent["stage"].map(STAGE_LABELS)
+            st.dataframe(
+                recent[["When (Botswana time)", "minutes", "Furthest step"]].rename(columns={"minutes": "Minutes"}),
+                use_container_width=True,
+            )
+
+            export = usage.copy()
+            export["started_at"] = export["started_at"].dt.strftime("%Y-%m-%d %H:%M:%S")
+            st.download_button(
+                "Download usage.csv",
+                data=export[["started_at", "minutes", "seconds", "stage", "uid", "session_id"]]
+                .to_csv(index=False).encode("utf-8"),
+                file_name="usage.csv", mime="text/csv", key="usage_csv",
+            )
+            if hasattr(st, "fragment"):
+                st.caption(
+                    "Time is counted while the page is open (checked every 30 seconds), "
+                    "so it includes time spent reading."
+                )
+            else:
+                st.caption(
+                    "This Streamlit version is older, so time is only measured up to the "
+                    "visitor's last tap or click. Update Streamlit for more accurate times."
+                )
+
+        st.markdown("### Feedback")
         try:
             feedback_df = pd.read_csv("feedback.csv")
             st.write(f"{len(feedback_df)} response(s) so far.")
@@ -1141,7 +1423,7 @@ with st.expander("📊 View/download collected feedback (admin only)"):
             st.download_button(
                 "Download feedback.csv",
                 data=feedback_df.to_csv(index=False).encode("utf-8"),
-                file_name="feedback.csv", mime="text/csv",
+                file_name="feedback.csv", mime="text/csv", key="feedback_csv",
             )
         except FileNotFoundError:
             st.info("No feedback submitted yet.")
