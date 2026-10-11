@@ -8,6 +8,7 @@ Run this with:
 Requires: pip install streamlit pandas
 """
 
+import hashlib
 import json
 import os
 import re
@@ -15,7 +16,9 @@ import time
 import uuid
 from dataclasses import dataclass, field, asdict
 from datetime import date, datetime, timedelta, timezone
+from datetime import time as dt_time
 from typing import List, Optional
+from html import escape as esc
 from urllib.parse import quote
 
 import pandas as pd
@@ -23,6 +26,14 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 PLANS_DIR = "plans"  # one JSON file per visitor, named by their private ID
+BREAK_MINUTES = 10  # gap placed between subjects in the timed routine and calendar file
+DEFAULT_STUDY_START = "16:00"
+# How the calendar-file labels the special days (the on-screen labels have emoji)
+ICS_EVENT_NAMES = {
+    "🎓 Exam": "Exam",
+    "📌 Material deadline": "Finish the content by today",
+    "📝 Practice test": "Practice paper",
+}
 USAGE_DIR = "usage"  # one tiny file per visit, used to measure time spent in the app
 BOTSWANA_TZ = timezone(timedelta(hours=2))  # Botswana (CAT) is UTC+2 all year
 
@@ -305,6 +316,131 @@ def timetable_to_dataframe(timetable):
     return pd.DataFrame(rows)
 
 
+def parse_clock(text, fallback=DEFAULT_STUDY_START):
+    """'16:30' -> datetime.time. Falls back to 16:00 if the text is not a valid time."""
+    for candidate in (text, fallback):
+        try:
+            hh, mm = str(candidate).split(":")[:2]
+            return dt_time(int(hh), int(mm))
+        except (ValueError, TypeError):
+            continue
+    return dt_time(16, 0)
+
+
+def day_blocks(entry, day_date, start_time):
+    """Turn one day's [(subject, hours)] into clock-timed study blocks.
+    Subjects follow one another from start_time, with BREAK_MINUTES between them."""
+    blocks = []
+    cursor = datetime.combine(day_date, start_time)
+    for name, hours in entry["allocations"]:
+        minutes = to_minutes(hours)
+        if minutes <= 0:
+            continue
+        end = cursor + timedelta(minutes=minutes)
+        blocks.append({"subject": name, "start": cursor, "end": end, "minutes": minutes})
+        cursor = end + timedelta(minutes=BREAK_MINUTES)
+    return blocks
+
+
+def _slug(text):
+    """A short, file-safe ID for a name. A few characters of a hash are added so
+    that two different names can never end up with the same ID."""
+    plain = re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-") or "x"
+    return f"{plain}-{hashlib.sha1(str(text).encode('utf-8')).hexdigest()[:6]}"
+
+
+def _ics_text(text):
+    """Escape text for a calendar (.ics) file."""
+    return (str(text).replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
+            .replace("\r\n", "\\n").replace("\n", "\\n"))
+
+
+def _ics_fold(line):
+    """Calendar files may not have lines over 75 bytes; longer ones are split
+    with a CRLF and a space. Splits fall between characters, never inside one."""
+    chunks, current, size = [], "", 0
+    for ch in line:
+        width = len(ch.encode("utf-8"))
+        limit = 75 if not chunks else 74  # continuation lines begin with one space
+        if size + width > limit:
+            chunks.append(current)
+            current, size = ch, width
+        else:
+            current += ch
+            size += width
+    chunks.append(current)
+    return "\r\n ".join(chunks)
+
+
+def build_ics(timetable, events, start_date, study_start, plan_id, owner="", from_date=None):
+    """A calendar file (.ics) that Google, Apple and Outlook calendars can import.
+    Study blocks get clock times; exams, deadlines and practice papers are all-day
+    events. Days before `from_date` are left out. Times are 'floating', so they
+    show at the same clock time in whatever time zone the calendar uses."""
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    cal_name = f"{owner}'s study timetable" if owner else "Study timetable"
+    lines = [
+        "BEGIN:VCALENDAR", "VERSION:2.0",
+        "PRODID:-//Study Timetable Optimizer//EN",
+        "CALSCALE:GREGORIAN", "METHOD:PUBLISH",
+        f"X-WR-CALNAME:{_ics_text(cal_name)}",
+    ]
+    for entry in timetable:
+        day = entry["day"]
+        day_date = start_date + timedelta(days=day - 1)
+        if from_date and day_date < from_date:
+            continue
+        for b in day_blocks(entry, day_date, study_start):
+            description = f"{b['minutes']} minutes. Planned by the Study Timetable Optimizer."
+            lines += [
+                "BEGIN:VEVENT",
+                f"UID:{plan_id}-d{day}-{_slug(b['subject'])}@studytimetable",
+                f"DTSTAMP:{stamp}",
+                f"DTSTART:{b['start']:%Y%m%dT%H%M%S}",
+                f"DTEND:{b['end']:%Y%m%dT%H%M%S}",
+                f"SUMMARY:{_ics_text('Study: ' + b['subject'])}",
+                f"DESCRIPTION:{_ics_text(description)}",
+                "END:VEVENT",
+            ]
+        for name, label in events.get(day, []):
+            kind = ICS_EVENT_NAMES.get(label, label)
+            lines += [
+                "BEGIN:VEVENT",
+                f"UID:{plan_id}-d{day}-{_slug(name)}-{_slug(kind)}@studytimetable",
+                f"DTSTAMP:{stamp}",
+                f"DTSTART;VALUE=DATE:{day_date:%Y%m%d}",
+                f"DTEND;VALUE=DATE:{day_date + timedelta(days=1):%Y%m%d}",
+                f"SUMMARY:{_ics_text(kind + ': ' + name)}",
+                "END:VEVENT",
+            ]
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(_ics_fold(line) for line in lines) + "\r\n"
+
+
+def group_weeks(timetable, start_date):
+    """Split the plan into Monday-to-Sunday weeks: a list of lists of (date, entry).
+    The first and last weeks may be partial."""
+    weeks, current_monday = [], None
+    for entry in timetable:
+        day_date = start_date + timedelta(days=entry["day"] - 1)
+        monday = day_date - timedelta(days=day_date.weekday())
+        if monday != current_monday:
+            weeks.append([])
+            current_monday = monday
+        weeks[-1].append((day_date, entry))
+    return weeks
+
+
+def default_week_index(weeks, today):
+    """The week to show first: the one containing today (or the last week if the
+    plan is over, or the first if it hasn't started)."""
+    index = 0
+    for i, week in enumerate(weeks):
+        if week[0][0] <= today:
+            index = i
+    return index
+
+
 def render_calendar_html(timetable, events, start_date, color_map, today=None):
     """Build a standalone, printable HTML page showing the calendar visually."""
     today = today or date.today()
@@ -349,9 +485,9 @@ def render_calendar_html(timetable, events, start_date, color_map, today=None):
             if not e["allocations"]:
                 lines = [e.get("note", "Free day")]
             else:
-                lines = [f"{name}: {to_minutes(hours)} min" for name, hours in e["allocations"]]
+                lines = [f"{esc(name)}: {to_minutes(hours)} min" for name, hours in e["allocations"]]
             for name, etype in day_events:
-                lines.append(f"{etype}: {name}")
+                lines.append(f"{etype}: {esc(name)}")
 
             border = "border:3px solid #4C6EF5;" if is_today else "border:2px solid #CED4DA;"
             opacity = "opacity:0.6;" if is_past else ""
@@ -451,6 +587,55 @@ def inject_css():
         .cal-list-row * {
             color: #000000 !important;
         }
+        .wk-wrap {
+            overflow-x: auto;
+        }
+        .wk-table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0 6px;
+            font-family: 'Comic Sans MS', 'Chalkboard SE', 'Brush Script MT', cursive;
+        }
+        .wk-table th {
+            background: #E8929A;
+            color: #FFFFFF !important;
+            padding: 10px 12px;
+            text-align: left;
+        }
+        .wk-table th:first-child {
+            border-radius: 10px 0 0 10px;
+        }
+        .wk-table th:last-child {
+            border-radius: 0 10px 10px 0;
+        }
+        .wk-table td {
+            padding: 10px 12px;
+            vertical-align: top;
+            text-align: left;
+        }
+        .wk-table td, .wk-table td * {
+            color: #000000 !important;
+        }
+        .wk-table td:first-child {
+            border-radius: 10px 0 0 10px;
+            white-space: nowrap;
+        }
+        .wk-table td:last-child {
+            border-radius: 0 10px 10px 0;
+        }
+        .wk-today td {
+            border-top: 3px solid #4C6EF5;
+            border-bottom: 3px solid #4C6EF5;
+        }
+        .wk-today td:first-child {
+            border-left: 3px solid #4C6EF5;
+        }
+        .wk-today td:last-child {
+            border-right: 3px solid #4C6EF5;
+        }
+        .wk-past td {
+            opacity: 0.5;
+        }
         div[data-testid="column"] div[data-testid="stButton"] button {
             width: 100%;
             border-radius: 8px;
@@ -539,7 +724,7 @@ def render_subject_cards(subjects, color_map, start_date=None):
 
         card_html = (
             f'<div class="subject-card" style="--accent:{color}">'
-            f'<h4>{s.name}</h4>'
+            f'<h4>{esc(s.name)}</h4>'
             f'<div class="meta">'
             f'📊 Recent scores: {scores_str}<br>'
             f'🧠 Confidence: {s.confidence}/10<br>'
@@ -687,12 +872,12 @@ def render_calendar_list(timetable, events, start_date, practice_test_link, colo
         elif not e["allocations"]:
             body = e.get("note", "Free day")
         else:
-            parts = [f"{name}: {to_minutes(hours)} min" for name, hours in e["allocations"]]
+            parts = [f"{esc(name)}: {to_minutes(hours)} min" for name, hours in e["allocations"]]
             body = " · ".join(parts)
 
         event_line = ""
         if day_events and not is_past:
-            event_line = "<br>" + " · ".join(f"{etype}: {name}" for name, etype in day_events)
+            event_line = "<br>" + " · ".join(f"{etype}: {esc(name)}" for name, etype in day_events)
 
         st.markdown(
             f"<div class='{css_class}' style='background:{bg_color};'>"
@@ -705,6 +890,68 @@ def render_calendar_list(timetable, events, start_date, practice_test_link, colo
 
         if st.button("🔍 Details", key=f"details_list_{key_prefix}_{day}", use_container_width=True):
             show_day_dialog(label, e["allocations"], day_events, e.get("note"), practice_test_link)
+
+
+def render_weekly_routine(timetable, events, start_date, study_start, key_prefix, today=None):
+    """One week at a time, laid out as a routine with clock times. It has one row
+    per day, so it reads well on a phone as well as on a computer."""
+    today = today or date.today()
+    weeks = group_weeks(timetable, start_date)
+    labels = [f"Week {i + 1}: {w[0][0]:%d %b} – {w[-1][0]:%d %b}" for i, w in enumerate(weeks)]
+    last_date = weeks[-1][-1][0]
+    # The key includes the plan's dates, so a new plan with different weeks starts fresh
+    choice = st.selectbox(
+        "Choose a week", labels, index=default_week_index(weeks, today),
+        key=f"{key_prefix}_week_{start_date.isoformat()}_{last_date.isoformat()}",
+    )
+    week = weeks[labels.index(choice)]
+
+    rows, week_minutes = [], 0
+    for day_date, entry in week:
+        weekday = day_date.weekday()
+        blocks = day_blocks(entry, day_date, study_start)
+        week_minutes += sum(b["minutes"] for b in blocks)
+        day_events = events.get(entry["day"], [])
+        status = " ✅" if day_date < today else " 🔵" if day_date == today else ""
+        exam = " 🎓" if any(label == "🎓 Exam" for _, label in day_events) else ""
+
+        if blocks:
+            lines = []
+            for b in blocks:
+                if b["start"].date() > day_date:
+                    note = " (after midnight)"
+                elif b["end"].date() > day_date:
+                    note = " (ends after midnight)"
+                else:
+                    note = ""
+                lines.append(
+                    f"<b>{b['start']:%H:%M}–{b['end']:%H:%M}</b>{note} · "
+                    f"{esc(b['subject'])} · {b['minutes']} min"
+                )
+            study = "<br>".join(lines)
+        else:
+            study = esc(entry.get("note", "No study planned"))
+        extras = "".join(f"<br><small>{label}: {esc(name)}</small>" for name, label in day_events)
+
+        classes = "wk-row"
+        if day_date < today:
+            classes += " wk-past"
+        elif day_date == today:
+            classes += " wk-today"
+        rows.append(
+            f"<tr class='{classes}' style='background:{WEEKDAY_COLORS[weekday]};'>"
+            f"<td>{WEEKDAY_STICKERS[weekday]} <b>{day_date:%a %d %b}</b>{status}{exam}</td>"
+            f"<td>{study}{extras}</td></tr>"
+        )
+
+    # One unbroken line of HTML: line breaks and indents can make Markdown show it as code
+    table = (
+        "<div class='wk-wrap'><table class='wk-table'>"
+        "<tr><th>Day</th><th>Study routine</th></tr>" + "".join(rows) + "</table></div>"
+    )
+    st.markdown(table, unsafe_allow_html=True)
+    hours, minutes = divmod(week_minutes, 60)
+    st.caption(f"Total study time this week: {hours} h {minutes:02d} min")
 
 
 # ---------- Persistence (so the calendar auto-updates day to day) ----------
@@ -723,7 +970,7 @@ def plan_path(uid):
 
 
 def save_plan(uid, subjects, total_days, hours_per_day, max_subjects_per_day, keep_warm,
-            practice_test_link, anchor_date, user_name=""):
+            practice_test_link, anchor_date, user_name="", study_start=DEFAULT_STUDY_START):
     data = {
         "anchor_date": anchor_date.isoformat(),
         "total_days": total_days,
@@ -733,6 +980,7 @@ def save_plan(uid, subjects, total_days, hours_per_day, max_subjects_per_day, ke
         "practice_test_link": practice_test_link,
         "subjects": [asdict(s) for s in subjects],
         "user_name": user_name,
+        "study_start": study_start,
     }
     with open(plan_path(uid), "w") as f:
         json.dump(data, f)
@@ -747,6 +995,7 @@ def load_plan(uid):
     data["anchor_date"] = date.fromisoformat(data["anchor_date"])
     data["subjects"] = [Subject(**s) for s in data["subjects"]]
     data.setdefault("user_name", "")  # older saved plans won't have this key
+    data["study_start"] = parse_clock(data.get("study_start"))  # older plans: 16:00
     return data
 
 
@@ -887,8 +1136,9 @@ if not st.session_state["intro_done"]:
         "2. **Step 1:** choose your start date and how many hours you can study each day\n"
         "3. **Step 2:** add each subject: its name, your last 3 exam marks, "
         "how confident you feel, and the day of its exam\n"
-        "4. **Step 3:** press the big *Make my timetable* button. "
-        "Your calendar appears right below it"
+        "4. **Step 3:** press the big *Make my timetable* button. Your weekly "
+        "routine and full calendar appear right below it, and you can add them "
+        "to Google Calendar"
     )
     st.info(
         "**Have these ready:** your last 3 full-exam marks for each subject "
@@ -927,7 +1177,7 @@ if not st.session_state["intro_done"]:
 
 user_name = st.session_state.get("user_name", "")
 title_name = f"{user_name}'s " if user_name else ""
-st.title(f"📚 {title_name}Study Timetable Optimizer")
+st.title(f"📚 {title_name}Study Timetable Optimizer", anchor="top")
 st.info(
     "👋 **How to use this page:** there are 3 steps below. "
     "**Step 1:** your study setup. **Step 2:** your subjects. "
@@ -952,8 +1202,15 @@ with st.expander("❓ Need help? Tap here for answers to common questions"):
         "**How do I come back to my timetable?** Bookmark this page, or add it to your "
         "phone's home screen. The link in your address bar is your personal link. Days that "
         "have passed turn grey on their own.\n\n"
+        "**What is the weekly routine?** A week-at-a-time view with clock times, so you can "
+        "follow it like a school timetable. Pick the week from the dropdown. The full calendar "
+        "shows the whole plan from start to finish.\n\n"
+        "**Can I put it in Google Calendar?** Yes. After you make your timetable, download the "
+        "calendar file (.ics) and import it. Step-by-step instructions are in that section.\n\n"
+        "**How do I jump to a section without scrolling?** Use the **Jump to** list in the sidebar "
+        "(on a phone, tap the small arrow at the top left to open it), or the links above your results.\n\n"
         "**The calendar looks cramped on my phone.** Switch to the **List** layout just above "
-        "the calendar."
+        "the full calendar."
     )
 
 
@@ -966,9 +1223,129 @@ def show_legend():
     )
 
 
+def shortcuts_markdown(plan_visible):
+    """The sidebar 'Jump to' list. The links only work for sections that exist."""
+    items = [
+        "- [⚙️ Step 1 · Setup](#step-1)",
+        "- [📚 Step 2 · Subjects](#step-2)",
+        "- [✨ Step 3 · Make timetable](#step-3)",
+    ]
+    if plan_visible:
+        items += [
+            "- [🗓️ Weekly routine](#weekly-routine)",
+            "- [📅 Full calendar](#full-calendar)",
+            "- [📲 Google Calendar & downloads](#downloads)",
+        ]
+    items.append("- [💬 Feedback](#feedback)")
+    return "**🧭 Jump to**\n\n" + "\n".join(items)
+
+
+def show_plan_views(timetable, events, subjects, start_date, practice_test_link, colors,
+                    key_prefix, study_start, owner_prefix, plan_uid, owner_name):
+    """Everything shown once a plan exists: subjects, the weekly routine, the full
+    calendar, and the downloads (including the Google Calendar file)."""
+    st.subheader(f"{owner_prefix}subjects, at a glance")
+    render_subject_cards(subjects, colors, start_date)
+
+    st.markdown(
+        "**Jump to:** [🗓️ Weekly routine](#weekly-routine) · "
+        "[📅 Full calendar](#full-calendar) · "
+        "[📲 Google Calendar & downloads](#downloads)"
+    )
+    show_legend()
+
+    st.subheader("🗓️ Your weekly routine", anchor="weekly-routine")
+    st.caption(
+        "One week at a time, with clock times. Your subjects follow one another from "
+        f"{study_start:%H:%M}, with a {BREAK_MINUTES}-minute break between them. "
+        "You can change the start time in Step 1."
+    )
+    render_weekly_routine(timetable, events, start_date, study_start, key_prefix)
+
+    st.subheader("📅 Your full calendar", anchor="full-calendar")
+    st.caption("The whole plan from start to finish, day by day.")
+    view_mode = st.radio(
+        "Calendar view", ["📅 Grid (best on PC)", "📋 List (best on phone)"],
+        index=1, horizontal=True, key=f"view_mode_{key_prefix}", label_visibility="collapsed",
+    )
+    if view_mode.startswith("📋"):
+        render_calendar_list(timetable, events, start_date, practice_test_link, colors, key_prefix=key_prefix)
+    else:
+        render_calendar(timetable, events, start_date, practice_test_link, colors, key_prefix=key_prefix)
+
+    st.subheader("📲 Add to Google Calendar & downloads", anchor="downloads")
+    ics_text = build_ics(
+        timetable, events, start_date, study_start, plan_uid,
+        owner=owner_name, from_date=date.today(),
+    )
+    st.download_button(
+        "📆 Download calendar file (.ics)", data=ics_text.encode("utf-8"),
+        file_name="study_timetable.ics", mime="text/calendar",
+        use_container_width=True, key=f"ics_{key_prefix}",
+    )
+    st.caption(
+        "Works with Google Calendar, Apple Calendar and Outlook. Study blocks get clock "
+        "times. Exams, content deadlines and practice papers are all-day events. Days "
+        "that have already passed are left out."
+    )
+    with st.expander("How do I add it to Google Calendar?"):
+        st.markdown(
+            "**On a computer**\n\n"
+            "1. Download the file above.\n"
+            "2. Open Google Calendar, click the ⚙️ gear, then **Settings**.\n"
+            "3. Choose **Import & export**, then **Import**.\n"
+            "4. Pick the file, choose which calendar to add it to, and press **Import**.\n\n"
+            "**On a phone**\n\n"
+            "Tap the downloaded file and choose your Calendar app when your phone asks. "
+            "If nothing happens, open Google Calendar in your phone's browser, ask for "
+            "the desktop site, and follow the computer steps. It can be fiddly.\n\n"
+            "**Good to know**\n\n"
+            "- Create a new calendar in Google Calendar first (for example called *Study*) "
+            "and import into that one. If you make a new timetable later, delete that "
+            "calendar and import again, so you don't get double entries.\n"
+            "- It is a one-time copy. Changing your timetable here does not change your "
+            "calendar.\n"
+            "- Times show as clock times in your calendar's own time zone."
+        )
+    st.link_button("Open Google Calendar", "https://calendar.google.com", key=f"gcal_{key_prefix}")
+
+    st.markdown("**Other downloads**")
+    dl1, dl2 = st.columns(2)
+    with dl1:
+        st.download_button(
+            "📄 Download as CSV (numbers)",
+            data=timetable_to_dataframe(timetable).to_csv(index=False).encode("utf-8"),
+            file_name="study_timetable.csv", mime="text/csv",
+            use_container_width=True, key=f"csv_{key_prefix}",
+        )
+    with dl2:
+        st.download_button(
+            "📅 Download as calendar (HTML)",
+            data=render_calendar_html(timetable, events, start_date, colors).encode("utf-8"),
+            file_name="study_timetable.html", mime="text/html",
+            use_container_width=True, key=f"html_{key_prefix}",
+        )
+    st.caption("The HTML version looks like the full calendar above. Open it in any browser or print it.")
+
+    if st.button(
+        "🔄 Start a new plan", key=f"startover_{key_prefix}",
+        help="Removes this timetable. Your answers above stay, so you can change them and make a new one.",
+    ):
+        try:
+            os.remove(plan_path(plan_uid))
+        except FileNotFoundError:
+            pass
+        st.session_state["plan_generated"] = False
+        st.rerun()
+    st.markdown("[⬆️ Back to top](#top)")
+
+
 # --- Auto-updating view of a saved plan, if one exists ---
+plan_visible = False   # becomes True once a plan is on the page (used for the sidebar shortcuts)
 saved = load_plan(uid)
-if saved:
+# Once a new timetable has been made this visit, only that one is shown (not the old saved copy too)
+if saved and not st.session_state.get("plan_generated"):
+    plan_visible = True
     set_stage("viewed_plan")
     saved_name = saved.get("user_name", "")
     saved_prefix = f"{saved_name}'s " if saved_name else "Your "
@@ -979,7 +1356,6 @@ if saved:
         "This updates automatically each day — days that have already "
         "passed are greyed out and marked done."
     )
-    show_legend()
     timetable = build_timetable(
         subjects=saved["subjects"],
         total_days=saved["total_days"],
@@ -990,49 +1366,22 @@ if saved:
     )
     events = collect_events(saved["subjects"])
     colors = subject_color_map(saved["subjects"])
-
-    st.markdown(f"**{saved_prefix}subjects, at a glance**")
-    render_subject_cards(saved["subjects"], colors, saved["anchor_date"])
-
-    view_mode_saved = st.radio(
-        "Calendar view", ["📅 Grid (best on PC)", "📋 List (best on phone)"],
-        index=1, horizontal=True, key="view_mode_saved", label_visibility="collapsed",
+    show_plan_views(
+        timetable, events, saved["subjects"], saved["anchor_date"],
+        saved["practice_test_link"], colors, "saved", saved["study_start"],
+        saved_prefix, uid, saved_name,
     )
-    if view_mode_saved.startswith("📋"):
-        render_calendar_list(timetable, events, saved["anchor_date"], saved["practice_test_link"], colors, key_prefix="saved")
-    else:
-        render_calendar(timetable, events, saved["anchor_date"], saved["practice_test_link"], colors, key_prefix="saved")
-
-    dl1, dl2 = st.columns(2)
-    with dl1:
-        df = timetable_to_dataframe(timetable)
-        st.download_button(
-            "📄 Download as CSV (numbers)", data=df.to_csv(index=False).encode("utf-8"),
-            file_name="study_timetable.csv", mime="text/csv",
-            use_container_width=True, key="csv_top",
-        )
-    with dl2:
-        html_page = render_calendar_html(timetable, events, saved["anchor_date"], colors)
-        st.download_button(
-            "📅 Download as calendar (HTML)", data=html_page.encode("utf-8"),
-            file_name="study_timetable.html", mime="text/html",
-            use_container_width=True, key="html_top",
-        )
-
-    if st.button("🔄 Start a new plan", help="Deletes this timetable so you can start again from scratch."):
-        os.remove(plan_path(uid))
-        st.rerun()
 
 st.divider()
 
 # --- Step 1: study setup (on the main page, because phones hide the sidebar) ---
-if saved:
+if saved and not st.session_state.get("plan_generated"):
     st.info(
         "✏️ Want to change your plan? Update the steps below and press "
         "**Make my timetable** again. It replaces your current plan."
     )
 
-st.subheader("Step 1 of 3 · Your study setup")
+st.subheader("Step 1 of 3 · Your study setup", anchor="step-1")
 st.caption("Tell us how much time you have for studying.")
 
 setup_left, setup_right = st.columns(2)
@@ -1060,6 +1409,13 @@ with setup_right:
     )
 plan_end = start_date + timedelta(days=int(total_days) - 1)
 st.caption(f"📅 Your plan will run from **{start_date:%a %d %b}** to **{plan_end:%a %d %b %Y}**.")
+study_start = st.time_input(
+    "What time do you usually start studying?",
+    value=saved["study_start"] if saved else parse_clock(DEFAULT_STUDY_START),
+    key="setup_time",
+    help="Used for the clock times in your weekly routine and in the calendar file. "
+         "Your subjects follow one another from this time, with a short break between them.",
+)
 keep_warm = st.checkbox(
     "Keep every subject ticking over", value=True, key="setup_warm",
     help="Reserves a little time each day for the subject you've studied least recently, "
@@ -1067,6 +1423,7 @@ keep_warm = st.checkbox(
 )
 
 with st.sidebar:
+    shortcuts_slot = st.empty()   # filled in once we know whether a plan is on the page
     st.divider()
     st.markdown("**📤 Share this app**")
     _share_url = get_share_url()
@@ -1085,7 +1442,7 @@ with st.sidebar:
 practice_test_link = "https://chromewebstore.google.com/detail/past-paper-tracker/cmadpkpdpbcklhhijkmbajjolfmopgko"
 
 # --- Subject inputs ---
-st.subheader("Step 2 of 3 · Add your subjects")
+st.subheader("Step 2 of 3 · Add your subjects", anchor="step-2")
 st.caption(
     "Add one box per subject. If a subject has two papers, add each paper "
     "separately (for example *Physics Paper 1* and *Physics Paper 2*)."
@@ -1196,15 +1553,17 @@ elif any(re.fullmatch(r"subject \d+", n) for n in _names):
     )
 
 st.divider()
-st.subheader("Step 3 of 3 · Make your timetable")
+st.subheader("Step 3 of 3 · Make your timetable", anchor="step-3")
 st.caption("When everything above looks right, press the button. Your timetable appears just below it.")
 
 if st.button("✨ Make my timetable", type="primary", disabled=not can_generate):
     st.session_state["plan_generated"] = True
+    st.rerun()
 
 if st.session_state.get("plan_generated") and can_generate:
+    plan_visible = True
     set_stage("generated")
-    st.success("✅ Done! Your timetable is below.")
+    st.success("✅ Done! Your weekly routine, full calendar and Google Calendar file are below.")
     name_to_index = {s.name: i for i, s in enumerate(subjects)}
     practice_test_results = enforce_practice_test_limit(subjects, max_per_day=3)
 
@@ -1254,23 +1613,14 @@ if st.session_state.get("plan_generated") and can_generate:
     colors = subject_color_map(subjects)
 
     save_plan(uid, subjects, int(total_days), hours_per_day, int(max_subjects_per_day),
-            keep_warm, practice_test_link, start_date, user_name=user_name)
+            keep_warm, practice_test_link, start_date, user_name=user_name,
+            study_start=study_start.strftime("%H:%M"))
 
     name_prefix = f"{user_name}'s " if user_name else "Your "
-    st.subheader(f"{name_prefix}subjects, at a glance")
-    render_subject_cards(subjects, colors, start_date)
-
-    st.subheader("Your calendar")
-    show_legend()
-    view_mode_new = st.radio(
-        "Calendar view", ["📅 Grid (best on PC)", "📋 List (best on phone)"],
-        index=1, horizontal=True, key="view_mode_new", label_visibility="collapsed",
+    show_plan_views(
+        timetable, events, subjects, start_date, practice_test_link, colors,
+        "new", study_start, name_prefix, uid, user_name,
     )
-    if view_mode_new.startswith("📋"):
-        render_calendar_list(timetable, events, start_date, practice_test_link, colors, key_prefix="new")
-    else:
-        render_calendar(timetable, events, start_date, practice_test_link, colors, key_prefix="new")
-
     st.caption(
         "🔖 Saved. Bookmark this page (or add it to your home screen) — the link in "
         "your address bar is your personal link, and it's how you get back to your plan."
@@ -1279,24 +1629,6 @@ if st.session_state.get("plan_generated") and can_generate:
         "📤 Sharing the app with friends? Send them the link **without** the "
         "`?u=...` part, so they start with their own fresh plan."
     )
-
-    dl1, dl2 = st.columns(2)
-    with dl1:
-        df = timetable_to_dataframe(timetable)
-        csv = df.to_csv(index=False).encode("utf-8")
-        st.download_button(
-            "📄 Download as CSV (numbers)", data=csv,
-            file_name="study_timetable.csv", mime="text/csv",
-            use_container_width=True, key="csv_new",
-        )
-    with dl2:
-        html_page = render_calendar_html(timetable, events, start_date, colors)
-        st.download_button(
-            "📅 Download as calendar (HTML)", data=html_page.encode("utf-8"),
-            file_name="study_timetable.html", mime="text/html",
-            use_container_width=True, key="html_new",
-        )
-    st.caption("The HTML version looks like the calendar above — open it in any browser or print it.")
 
     with st.expander("How this was calculated"):
         st.write(
@@ -1315,6 +1647,9 @@ if st.session_state.get("plan_generated") and can_generate:
         )
 
 
+shortcuts_slot.markdown(shortcuts_markdown(plan_visible))
+
+
 # ---------- Share ----------
 
 _share_url_main = get_share_url()
@@ -1327,7 +1662,7 @@ if _share_url_main:
 # ---------- Feedback ----------
 
 st.divider()
-st.subheader("💬 Was this helpful?")
+st.subheader("💬 Was this helpful?", anchor="feedback")
 
 rating = st.slider("Rate this tool (1-5)", 1, 5, 5, key="feedback_rating")
 comment = st.text_area("Any feedback or suggestions?", key="feedback_comment")
