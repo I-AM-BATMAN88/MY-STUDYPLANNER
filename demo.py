@@ -34,6 +34,45 @@ ICS_EVENT_NAMES = {
     "📌 Material deadline": "Finish the content by today",
     "📝 Practice test": "Practice paper",
 }
+# Help menu: (question, answer). Each question becomes its own drop-down.
+HELP_ITEMS = [
+    ('What is a "day number"?',
+     "Day 1 is your start date, day 2 is the next day, and so on. The page shows the real "
+     "date next to each exam day so you can check it."),
+    ("Which marks do I enter?",
+     "Your percentage marks from your last 3 full exams in that subject, oldest first. "
+     "If you only have one, type it in all three boxes."),
+    ('What does "confidence" mean?',
+     "How sure you feel about the subject right now, from 1 (not at all) to 10 (very). It "
+     "counts for 30% of how the timetable judges the subject. Your marks count for the rest."),
+    ('What does "most subjects in one day" mean?',
+     "The most different subjects you want to study in a single day. 3 is a good start."),
+    ("What are the practice paper days?",
+     "They are optional. Type day numbers separated by commas. They show on your calendar "
+     "with a Past Paper Tracker button (a Chrome extension that only works on a PC)."),
+    ("Why is there no study time on an exam day?",
+     "Exam days are for sitting the exam, so that subject is left out that day."),
+    ("How do I come back to my timetable?",
+     "Bookmark this page, or add it to your phone's home screen. The link in your address "
+     "bar is your personal link. Days that have passed turn grey on their own."),
+    ("What is the weekly routine?",
+     "A week-at-a-time view of what to study and for how many minutes. Tap the **Weekly "
+     "routine** button to open it and pick the week from the dropdown. The **Full calendar** "
+     "button shows the whole plan from start to finish. Both stay hidden until you tap them."),
+    ("What is the study timer?",
+     "Tap a day's **🔍 Details** to open its card. Inside is an optional timer. Pick a "
+     "subject, press **Start**, and it counts down the time planned for that subject (or "
+     "counts up as a stopwatch if you choose Free study)."),
+    ("Can I put it in Google Calendar?",
+     "Yes. After you make your timetable, download the calendar file (.ics) and import it. "
+     "Step-by-step instructions are in that section."),
+    ("How do I jump to a section without scrolling?",
+     "Use the **Jump to** buttons in the sidebar (on a phone, tap the small arrow at the top "
+     "left to open it), or the buttons just above your results. Tap one and the page scrolls "
+     "to that section."),
+    ("The calendar looks cramped on my phone.",
+     "Open the **Full calendar** and switch to the **List** layout just above it."),
+]
 USAGE_DIR = "usage"  # one tiny file per visit, used to measure time spent in the app
 BOTSWANA_TZ = timezone(timedelta(hours=2))  # Botswana (CAT) is UTC+2 all year
 
@@ -73,6 +112,38 @@ def whatsapp_share_link(url):
         "schedule from your exam scores and exam dates: " + url
     )
     return "https://wa.me/?text=" + quote(text)
+
+
+def jump_button(label, anchor):
+    """A button-shaped control that scrolls the page to a section. A real Streamlit
+    button cannot scroll the page, so this is a styled in-page link (see .jump-btn)."""
+    return f'<a class="jump-btn" href="#{anchor}" target="_self">{esc(label)}</a>'
+
+
+def jump_bar_html(items, label="Jump to:"):
+    """A row of jump buttons. `items` is a list of (label, anchor). One line of HTML,
+    so Markdown can't mistake it for a code block."""
+    heading = f'<span class="jump-label">{esc(label)}</span>' if label else ""
+    return '<div class="jump-bar">' + heading + "".join(jump_button(t, a) for t, a in items) + "</div>"
+
+
+def shortcuts_html(plan_visible):
+    """The sidebar 'Jump to' buttons. Buttons for sections that don't exist yet are left out."""
+    items = [
+        ("⚙️ Step 1 · Setup", "step-1"),
+        ("📚 Step 2 · Subjects", "step-2"),
+        ("✨ Step 3 · Make timetable", "step-3"),
+    ]
+    if plan_visible:
+        items += [
+            ("📅 Weekly routine & full calendar", "timetable"),
+            ("📲 Google Calendar & downloads", "downloads"),
+        ]
+    items.append(("💬 Feedback", "feedback"))
+    return (
+        '<div class="jump-label">🧭 Jump to</div><div class="jump-col">'
+        + "".join(jump_button(t, a) for t, a in items) + "</div>"
+    )
 
 
 def copy_button_html(url):
@@ -814,6 +885,42 @@ def inject_css():
         .wk-past td {
             opacity: 0.5;
         }
+        .jump-bar {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+            margin: 4px 0 12px 0;
+        }
+        .jump-label {
+            font-weight: 600;
+            margin-bottom: 4px;
+        }
+        .jump-col {
+            display: flex;
+            flex-direction: column;
+            gap: 8px;
+        }
+        .jump-btn, .jump-btn:visited {
+            display: inline-block;
+            padding: 8px 14px;
+            border: 1px solid rgba(49, 51, 63, 0.25);
+            border-radius: 8px;
+            background: #FFFFFF;
+            color: #31333F !important;
+            text-decoration: none !important;
+            font-size: 0.95rem;
+            line-height: 1.25;
+            cursor: pointer;
+        }
+        .jump-btn:hover {
+            border-color: #4C6EF5;
+            color: #4C6EF5 !important;
+        }
+        .jump-col .jump-btn {
+            display: block;
+            text-align: left;
+        }
         div[data-testid="column"] div[data-testid="stButton"] button {
             width: 100%;
             border-radius: 8px;
@@ -872,6 +979,11 @@ def inject_css():
             .cal-list-row {
                 padding: 14px 16px;
                 font-size: 1.05em;
+            }
+            .jump-bar .jump-btn {
+                flex: 1 1 100%;
+                text-align: center;
+                padding: 12px 14px;
             }
         }
         </style>
@@ -1375,39 +1487,21 @@ st.info(
     "**Step 1:** your study setup. **Step 2:** your subjects. "
     "**Step 3:** press the button to get your timetable."
 )
-with st.expander("❓ Need help? Tap here for answers to common questions"):
-    st.markdown(
-        '**What is a "day number"?** Day 1 is your start date, day 2 is the next day, '
-        "and so on. The page shows the real date next to each exam day so you can check it.\n\n"
-        "**Which marks do I enter?** Your percentage marks from your last 3 full exams in that "
-        "subject, oldest first. If you only have one, type it in all three boxes.\n\n"
-        '**What does "confidence" mean?** How sure you feel about the subject right now, from '
-        "1 (not at all) to 10 (very). It counts for 30% of how the timetable judges the "
-        "subject. Your marks count for the rest.\n\n"
-        '**What does "most subjects in one day" mean?** The most different subjects you want '
-        "to study in a single day. 3 is a good start.\n\n"
-        "**What are the practice paper days?** They are optional. Type day numbers separated "
-        "by commas. They show on your calendar with a Past Paper Tracker button (a Chrome "
-        "extension that only works on a PC).\n\n"
-        "**Why is there no study time on an exam day?** Exam days are for sitting the exam, "
-        "so that subject is left out that day.\n\n"
-        "**How do I come back to my timetable?** Bookmark this page, or add it to your "
-        "phone's home screen. The link in your address bar is your personal link. Days that "
-        "have passed turn grey on their own.\n\n"
-        "**What is the weekly routine?** A week-at-a-time view of what to study and for how many "
-        "minutes. Tap the **Weekly routine** button to open it and pick the week from the dropdown. "
-        "The **Full calendar** button shows the whole plan from start to finish. Both stay hidden "
-        "until you tap them.\n\n"
-        "**What is the study timer?** Tap a day's **🔍 Details** to open its card. Inside is an "
-        "optional timer. Pick a subject, press **Start**, and it counts down the time planned for "
-        "that subject (or counts up as a stopwatch if you choose Free study).\n\n"
-        "**Can I put it in Google Calendar?** Yes. After you make your timetable, download the "
-        "calendar file (.ics) and import it. Step-by-step instructions are in that section.\n\n"
-        "**How do I jump to a section without scrolling?** Use the **Jump to** list in the sidebar "
-        "(on a phone, tap the small arrow at the top left to open it), or the links above your results.\n\n"
-        "**The calendar looks cramped on my phone.** Switch to the **List** layout just above "
-        "the full calendar."
-    )
+# Streamlit does not allow a drop-down inside another drop-down, so the help menu is a
+# button that opens a box in which every question is its own drop-down.
+_help_open = st.session_state.get("help_open", False)
+if st.button(
+    "▲ Close help" if _help_open else "❓ Need help? Tap here for answers to common questions",
+    key="help_toggle", use_container_width=True,
+):
+    st.session_state["help_open"] = not _help_open
+    st.rerun()
+if _help_open:
+    with st.container(border=True):
+        st.caption("Tap a question to see its answer.")
+        for _question, _answer in HELP_ITEMS:
+            with st.expander(_question):
+                st.markdown(_answer)
 
 
 def show_legend():
@@ -1418,22 +1512,6 @@ def show_legend():
     )
 
 
-def shortcuts_markdown(plan_visible):
-    """The sidebar 'Jump to' list. The links only work for sections that exist."""
-    items = [
-        "- [⚙️ Step 1 · Setup](#step-1)",
-        "- [📚 Step 2 · Subjects](#step-2)",
-        "- [✨ Step 3 · Make timetable](#step-3)",
-    ]
-    if plan_visible:
-        items += [
-            "- [📅 Weekly routine & full calendar](#timetable)",
-            "- [📲 Google Calendar & downloads](#downloads)",
-        ]
-    items.append("- [💬 Feedback](#feedback)")
-    return "**🧭 Jump to**\n\n" + "\n".join(items)
-
-
 def show_plan_views(timetable, events, subjects, start_date, practice_test_link, colors,
                     key_prefix, owner_prefix, plan_uid, owner_name):
     """Everything shown once a plan exists: subjects, two buttons that open the weekly
@@ -1442,8 +1520,11 @@ def show_plan_views(timetable, events, subjects, start_date, practice_test_link,
     render_subject_cards(subjects, colors, start_date)
 
     st.markdown(
-        "**Jump to:** [📅 Weekly routine & full calendar](#timetable) · "
-        "[📲 Google Calendar & downloads](#downloads)"
+        jump_bar_html([
+            ("📅 Weekly routine & full calendar", "timetable"),
+            ("📲 Google Calendar & downloads", "downloads"),
+        ]),
+        unsafe_allow_html=True,
     )
     show_legend()
 
@@ -1557,7 +1638,7 @@ def show_plan_views(timetable, events, subjects, start_date, practice_test_link,
             pass
         st.session_state["plan_generated"] = False
         st.rerun()
-    st.markdown("[⬆️ Back to top](#top)")
+    st.markdown(jump_bar_html([("⬆️ Back to top", "top")], label=None), unsafe_allow_html=True)
 
 
 # --- Auto-updating view of a saved plan, if one exists ---
@@ -1862,7 +1943,7 @@ if st.session_state.get("plan_generated") and can_generate:
         )
 
 
-shortcuts_slot.markdown(shortcuts_markdown(plan_visible))
+shortcuts_slot.markdown(shortcuts_html(plan_visible), unsafe_allow_html=True)
 
 
 # ---------- Share ----------
